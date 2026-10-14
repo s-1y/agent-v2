@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Agent V2 工作树</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --line: #c9ced6; --text: #1f2328; --muted: #6e7781;
+    --running: #0969da; --waiting: #bf8700; --staged: #8c959f; --finished: #1a7f37;
+    --working: #cf222e;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+         color: var(--text); background: var(--bg); }
+  header { display: flex; align-items: center; gap: 16px; padding: 10px 20px;
+           background: var(--card); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; }
+  header .meta { color: var(--muted); font-size: 13px; }
+  header .state { padding: 2px 10px; border-radius: 10px; font-size: 12px; color: #fff; }
+  header .state.live { background: var(--running); }
+  header .state.done { background: var(--finished); }
+  header button { margin-left: auto; padding: 4px 12px; cursor: pointer; }
+  #brief { padding: 8px 20px; color: var(--muted); font-size: 13px; border-bottom: 1px solid var(--line);
+           white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  main { display: flex; height: calc(100vh - 90px); }
+  #tree { flex: 1 1 55%; overflow: auto; padding: 16px 20px; }
+  #detail { flex: 1 1 45%; overflow: auto; padding: 16px 20px; background: var(--card);
+            border-left: 1px solid var(--line); }
+  #detail .empty { color: var(--muted); }
+
+  ul.tree, ul.tree ul { list-style: none; margin: 0; padding: 0; }
+  ul.tree ul { margin-left: 22px; }
+  ul.tree li { position: relative; padding: 4px 0 4px 18px; }
+  ul.tree ul li::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0;
+                          border-left: 1px solid var(--line); }
+  ul.tree ul li:last-child::before { bottom: auto; height: 22px; }
+  ul.tree ul li::after { content: ""; position: absolute; left: 0; top: 22px; width: 16px;
+                         border-top: 1px solid var(--line); }
+  ul.tree > li { padding-left: 0; }
+
+  .node { display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer;
+          background: var(--card); border: 1px solid var(--line); border-left: 4px solid var(--staged);
+          border-radius: 6px; }
+  .node:hover { box-shadow: 0 1px 4px rgba(0,0,0,.12); }
+  .node.selected { outline: 2px solid var(--running); outline-offset: 1px; }
+  .node.s-running { border-left-color: var(--running); }
+  .node.s-waiting { border-left-color: var(--waiting); }
+  .node.s-staged { border-left-color: var(--staged); border-style: dashed; opacity: .7; }
+  .node.s-finished { border-left-color: var(--finished); }
+  .node.working { border-color: var(--working); border-left-color: var(--working);
+                  animation: breathe 1.6s ease-in-out infinite; }
+  @keyframes breathe { 0%, 100% { box-shadow: 0 0 0 0 rgba(207,34,46,.45); }
+                       50% { box-shadow: 0 0 0 6px rgba(207,34,46,0); } }
+  .id { font-family: ui-monospace, Menlo, monospace; color: var(--muted); }
+  .title { font-weight: 600; }
+  .badge { font-size: 12px; padding: 1px 8px; border-radius: 10px; background: #eaeef2; color: var(--text); }
+  .badge.phase { font-family: ui-monospace, Menlo, monospace; }
+  .badge.finished { background: #dafbe1; color: var(--finished); }
+  .badge.org { background: #ddf4ff; color: var(--running); }
+  .badge.work { background: var(--working); color: #fff; font-weight: 600; }
+
+  #detail h2 { font-size: 16px; margin: 0 0 8px; }
+  #detail h3 { font-size: 14px; margin: 18px 0 6px; }
+  #detail pre { white-space: pre-wrap; word-break: break-word; margin: 0; padding: 10px;
+                background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+                font: 13px/1.55 ui-monospace, Menlo, "Noto Sans Mono CJK SC", monospace; }
+  #detail .ws { border-top: 1px dashed var(--line); margin-top: 16px; padding-top: 8px; }
+  #detail .kv { color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent V2 工作树</h1>
+  <span id="state" class="state live">加载中</span>
+  <span id="meta" class="meta"></span>
+  <button id="refresh">立即刷新</button>
+</header>
+<div id="brief"></div>
+<main>
+  <section id="tree"></section>
+  <section id="detail"><div class="empty">点击左侧节点查看 plan 和详情。</div></section>
+</main>
+<script>
+const REFRESH_MS = 20000;
+let selectedId = null;
+let nextAt = 0;
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+}
+
+function nodeCard(n) {
+  const card = el("div", `node s-${n.status}` + (n.working ? " working" : "") +
+                         (n.id === selectedId ? " selected" : ""));
+  card.appendChild(el("span", "id", n.id));
+  card.appendChild(el("span", "title", n.title || "root"));
+  if (n.status === "finished") {
+    card.appendChild(el("span", "badge finished", "finished"));
+  } else {
+    card.appendChild(el("span", "badge phase", n.phase));
+  }
+  const ws = n.workspace;
+  if (ws && ws.org_mode) card.appendChild(el("span", "badge org", ws.org_mode));
+  if (n.working) card.appendChild(el("span", "badge work", "WORKING"));
+  card.title = `status: ${n.status}` + (ws ? ` · ${ws.id}/${ws.status}` : "");
+  card.onclick = () => select(n.id);
+  return card;
+}
+
+function renderBranch(nodes, id) {
+  const n = nodes[id];
+  const li = el("li");
+  li.appendChild(nodeCard(n));
+  if (n.children_ids.length) {
+    const ul = el("ul");
+    for (const cid of n.children_ids) if (nodes[cid]) ul.appendChild(renderBranch(nodes, cid));
+    li.appendChild(ul);
+  }
+  return li;
+}
+
+async function loadTree() {
+  nextAt = Date.now() + REFRESH_MS;
+  let data;
+  try {
+    data = await (await fetch("/api/tree", { cache: "no-store" })).json();
+  } catch (err) {
+    document.getElementById("state").textContent = "连接失败";
+    return;
+  }
+  const treeBox = document.getElementById("tree");
+  const state = document.getElementById("state");
+  if (!data.ready) {
+    state.textContent = "等待中";
+    treeBox.replaceChildren(el("div", "empty", data.message));
+    return;
+  }
+  state.textContent = data.finished ? "已结束" : "运行中";
+  state.className = "state " + (data.finished ? "done" : "live");
+  const working = Object.values(data.nodes).filter(n => n.working).map(n => n.id);
+  document.getElementById("meta").textContent =
+    `落盘于 ${new Date(data.updated_at * 1000).toLocaleTimeString()} · ` +
+    `${Object.keys(data.nodes).length} 个节点 · working: ${working.join(", ") || "无"}`;
+  document.getElementById("brief").textContent = "要求：" + data.root_brief;
+  document.getElementById("brief").title = data.root_brief;
+
+  const ul = el("ul", "tree");
+  ul.appendChild(renderBranch(data.nodes, data.root_id));
+  treeBox.replaceChildren(ul);
+  if (selectedId) loadDetail(selectedId);
+}
+
+function select(id) {
+  selectedId = id;
+  document.querySelectorAll(".node.selected").forEach(e => e.classList.remove("selected"));
+  document.querySelectorAll(".node").forEach(e => {
+    if (e.querySelector(".id").textContent === id) e.classList.add("selected");
+  });
+  loadDetail(id);
+}
+
+function section(box, title, text) {
+  if (!text || !text.trim()) return;
+  box.appendChild(el("h3", null, title));
+  box.appendChild(el("pre", null, text));
+}
+
+async function loadDetail(id) {
+  const box = document.getElementById("detail");
+  let d;
+  try {
+    const resp = await fetch(`/api/node/${encodeURIComponent(id)}`, { cache: "no-store" });
+    if (!resp.ok) throw new Error(resp.status);
+    d = await resp.json();
+  } catch (err) {
+    box.replaceChildren(el("div", "empty", `读取 ${id} 失败`));
+    return;
+  }
+  if (id !== selectedId) return;
+  const out = document.createDocumentFragment();
+  out.appendChild(el("h2", null, `${d.id} ${d.title || "root"}`));
+  out.appendChild(el("div", "kv", `status: ${d.status} · phase: ${d.phase}`));
+
+  if (!d.workspaces.length) out.appendChild(el("p", "empty", "还没有工作区（尚未写 plan）。"));
+  for (const ws of d.workspaces.slice().reverse()) {
+    const block = el("div", "ws");
+    const mode = [ws.work_mode, ws.org_mode].filter(Boolean).join(" / ");
+    block.appendChild(el("h3", null, `工作区 ${ws.id} · ${ws.status}` + (mode ? ` · ${mode}` : "")));
+    section(block, "失败总结", ws.failure_summary);
+    if (ws.plan && ws.plan.trim()) {
+      section(block, "Plan", ws.plan);
+    } else {
+      block.appendChild(el("div", "kv", "（这个工作区没有 plan）"));
+    }
+    if (ws.questions.length) {
+      section(block, "待回答问题",
+        ws.questions.map(q => `${q.id} from ${q.child_id}: ${q.question}`).join("\n\n"));
+    }
+    if (ws.child_reports.length) {
+      section(block, "组员返回报告",
+        ws.child_reports.map(r => `【${r.child_id} ${r.title}】\n${r.message}`).join("\n\n"));
+    }
+    out.appendChild(block);
+  }
+  section(out, "返回给上级", d.return_message);
+  section(out, "上级交给它的任务", d.from_parent);
+  box.replaceChildren(out);
+}
+
+let timer = null;
+async function tick() {
+  clearTimeout(timer);
+  await loadTree();
+  timer = setTimeout(tick, Math.max(0, nextAt - Date.now()));
+}
+
+document.getElementById("refresh").onclick = tick;
+setInterval(() => {
+  const s = Math.max(0, Math.round((nextAt - Date.now()) / 1000));
+  document.getElementById("refresh").textContent = `立即刷新（${s}s）`;
+}, 1000);
+tick();
+</script>
+</body>
+</html>
