@@ -479,8 +479,24 @@ def apply_decision(
         return f"{node.id} dispatch({group.kind}) -> {', '.join(s.node_id for s in group.slots)}"
 
     if decision.kind == "ask_parent":
+        question_text = p.get("question", "").strip()
+        if not question_text:
+            return f"{node.id} ask_parent 失败：question 不能为空"
         if node.parent_id is None:
-            return f"{node.id} ask_parent 失败：根节点没有上级"
+            append_context_message(
+                node,
+                workspace,
+                (
+                    "## 上级回答\n\n"
+                    f"你刚才问：{question_text}\n\n"
+                    "上级回答：你可以自己决定\n\n"
+                    "请根据这个回答继续当前任务。"
+                ),
+                run_id=cfg.run_id,
+                condense_every=cfg.condense_every,
+            )
+            node.status = "running"
+            return f"{node.id} ask_parent -> 你可以自己决定"
         parent = tree.get(node.parent_id)
         active = parent.active_workspace()
         if active is None:
@@ -488,10 +504,8 @@ def apply_decision(
         question = ChildQuestion(
             id=_next_question_id(active),
             child_id=node.id,
-            question=p.get("question", "").strip(),
+            question=question_text,
         )
-        if not question.question:
-            return f"{node.id} ask_parent 失败：question 不能为空"
         active.questions.append(question)
         node.status = "waiting"
         parent.status = "running"

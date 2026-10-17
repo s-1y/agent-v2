@@ -6,7 +6,10 @@ Needs the meta-agent env: pip install openhands-sdk openhands-tools.
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+import shutil
+import threading
+import uuid
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Optional, Union
 
@@ -250,6 +253,82 @@ def _install_tool_name_glue() -> None:
 _install_tool_name_glue()
 
 
+class _BrowserLease:
+    """一次只有一个会话占用共享浏览器，离开时关掉页面。"""
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._owner: Optional[str] = None
+
+    def key(self, conversation) -> str:
+        if conversation is None:
+            return "anon"
+        return str(getattr(conversation, "id", id(conversation)))
+
+    def acquire(self, conversation) -> None:
+        key = self.key(conversation)
+        with self._cv:
+            while self._owner not in (None, key):
+                self._cv.wait()
+            self._owner = key
+
+    def release(self, conversation, close: Callable[[], None]) -> None:
+        key = self.key(conversation)
+        with self._cv:
+            if self._owner != key:
+                return
+        try:
+            close()
+        finally:
+            with self._cv:
+                if self._owner == key:
+                    self._owner = None
+                    self._cv.notify_all()
+
+
+_BROWSER_LEASE = _BrowserLease()
+
+
+def _close_shared_browser() -> None:
+    """关掉当前页面，并换一个空的浏览器配置，下一个人打开的是自己的。"""
+    executor = BrowserToolSet._shared_executor
+    if executor is None or not getattr(executor, "_initialized", False):
+        return
+    try:
+        executor._async_executor.run_async(executor.close_browser, timeout=30)
+    except Exception:
+        return
+    old = executor._config.get("user_data_dir")
+    executor._config["user_data_dir"] = str(
+        Path.home() / ".config" / "browseruse" / "profiles" / uuid.uuid4().hex
+    )
+    if old and "browseruse/profiles/" in str(old):
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def release_browser(conversation) -> None:
+    """这个会话的这一轮结束了。若它占着浏览器，关掉再把队列放行。"""
+    _BROWSER_LEASE.release(conversation, _close_shared_browser)
+
+
+def _install_browser_lease() -> None:
+    from openhands.tools.browser_use.impl import BrowserToolExecutor
+
+    if getattr(BrowserToolExecutor, "_meta_agent_lease", False):
+        return
+    original = BrowserToolExecutor.__call__
+
+    def __call__(self, action, conversation=None):
+        _BROWSER_LEASE.acquire(conversation)
+        return original(self, action, conversation)
+
+    BrowserToolExecutor.__call__ = __call__
+    BrowserToolExecutor._meta_agent_lease = True
+
+
+_install_browser_lease()
+
+
 def coding_tools() -> list[Tool]:
     """OpenHands coding hands plus the Chromium browser for 3A self-work."""
     return [
@@ -313,11 +392,16 @@ register_tool("ReadFileTool", ReadFileTool)
 
 
 def readonly_tools() -> list[Tool]:
-    """Eyes only: read a file, glob, grep. No file editor, no terminal."""
+    """计划会话全程可用：读文件、搜索，以及 Chromium。
+
+    没有编辑器和终端，所以这份会话改不了项目文件。
+    浏览器从第一次开工就在，后面的审阅阶段也还在。
+    """
     return [
         Tool(name="ReadFileTool"),
         Tool(name=GlobTool.name),
         Tool(name=GrepTool.name),
+        Tool(name=BrowserToolSet.name),
     ]
 
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from Agents.engine import (
+    release_browser,
     ActionEvent,
     Agent,
     AgentContext,
@@ -231,6 +232,7 @@ def run_turn(
             conversation.close()
         except Exception:
             pass
+        release_browser(conversation)
 
     return TurnResult(
         decision=decision,
