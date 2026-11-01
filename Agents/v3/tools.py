@@ -23,7 +23,6 @@ from Agents.v3.tool_prompts import load_tool_doc
 
 _DECISIONS: dict[str, "Decision"] = {}
 
-_FINISH_ORIENT = load_tool_doc("finish_orient")
 _CHOOSE_WORK_MODE = load_tool_doc("choose_work_mode")
 _CHOOSE_ORG_MODE = load_tool_doc("choose_org_mode")
 _WRITE_PLAN = load_tool_doc("write_plan")
@@ -35,11 +34,13 @@ _ASK_PARENT = load_tool_doc("ask_parent")
 _ANSWER_CHILD = load_tool_doc("answer_child_question")
 _CHANGE_PLAN = load_tool_doc("change_plan")
 _RETURN = load_tool_doc("return_to_parent")
+_SEND_NEXT = load_tool_doc("send_next")
+_FINISH_DESIGN = load_tool_doc("finish_design")
+_SEND_REVIEW_PLAN = load_tool_doc("send_review_plan")
 
 
 class Decision(BaseModel):
     kind: Literal[
-        "finish_orient",
         "choose_work_mode",
         "choose_org_mode",
         "write_plan",
@@ -51,6 +52,9 @@ class Decision(BaseModel):
         "answer_child_question",
         "change_plan",
         "return_to_parent",
+        "send_next",
+        "finish_design",
+        "send_review_plan",
     ]
     payload: dict[str, Any]
 
@@ -71,32 +75,6 @@ class _DecisionObservation(Observation):
 
 
 # --- stage choices ---
-
-
-class FinishOrientAction(Action):
-    pass
-
-
-class _FinishOrientExecutor(ToolExecutor):
-    def __call__(
-        self, action: FinishOrientAction, conversation=None
-    ) -> _DecisionObservation:
-        _stash(conversation, Decision(kind="finish_orient", payload={}))
-        return _DecisionObservation.from_text(_FINISH_ORIENT["observation"])
-
-
-class FinishOrientTool(ToolDefinition[FinishOrientAction, _DecisionObservation]):
-    @classmethod
-    def create(cls, conv_state=None, **params) -> Sequence["FinishOrientTool"]:
-        return [
-            cls(
-                name="finish_orient",
-                description=_FINISH_ORIENT["tool"],
-                action_type=FinishOrientAction,
-                observation_type=_DecisionObservation,
-                executor=_FinishOrientExecutor(),
-            )
-        ]
 
 
 class ChooseWorkModeAction(Action):
@@ -438,7 +416,6 @@ class ReturnToParentTool(
         ]
 
 
-register_tool("FinishOrientTool", FinishOrientTool)
 register_tool("ChooseWorkModeTool", ChooseWorkModeTool)
 register_tool("ChooseOrgModeTool", ChooseOrgModeTool)
 register_tool("WritePlanTool", WritePlanTool)
@@ -452,9 +429,99 @@ register_tool("ChangePlanTool", ChangePlanTool)
 register_tool("ReturnToParentTool", ReturnToParentTool)
 
 
+class SendNextAction(Action):
+    pass
+
+
+class _SendNextExecutor(ToolExecutor):
+    def __call__(self, action: SendNextAction, conversation=None) -> _DecisionObservation:
+        _stash(conversation, Decision(kind="send_next", payload={}))
+        return _DecisionObservation.from_text(_SEND_NEXT["observation"])
+
+
+class SendNextTool(ToolDefinition[SendNextAction, _DecisionObservation]):
+    @classmethod
+    def create(cls, conv_state=None, **params) -> Sequence["SendNextTool"]:
+        return [
+            cls(
+                name="send_next",
+                description=_SEND_NEXT["tool"],
+                action_type=SendNextAction,
+                observation_type=_DecisionObservation,
+                executor=_SendNextExecutor(),
+            )
+        ]
+
+
+register_tool("SendNextTool", SendNextTool)
+
+
+class FinishDesignAction(Action):
+    pass
+
+
+class _FinishDesignExecutor(ToolExecutor):
+    def __call__(
+        self, action: FinishDesignAction, conversation=None
+    ) -> _DecisionObservation:
+        _stash(conversation, Decision(kind="finish_design", payload={}))
+        return _DecisionObservation.from_text(_FINISH_DESIGN["observation"])
+
+
+class FinishDesignTool(ToolDefinition[FinishDesignAction, _DecisionObservation]):
+    @classmethod
+    def create(cls, conv_state=None, **params) -> Sequence["FinishDesignTool"]:
+        return [
+            cls(
+                name="finish_design",
+                description=_FINISH_DESIGN["tool"],
+                action_type=FinishDesignAction,
+                observation_type=_DecisionObservation,
+                executor=_FinishDesignExecutor(),
+            )
+        ]
+
+
+register_tool("FinishDesignTool", FinishDesignTool)
+
+
+class SendReviewPlanAction(Action):
+    plan: str = Field(description=_SEND_REVIEW_PLAN["plan"])
+
+
+class _SendReviewPlanExecutor(ToolExecutor):
+    def __call__(
+        self, action: SendReviewPlanAction, conversation=None
+    ) -> _DecisionObservation:
+        text = action.plan.strip()
+        if not text:
+            return _DecisionObservation.from_text("plan 不能为空。", is_error=True)
+        _stash(
+            conversation,
+            Decision(kind="send_review_plan", payload={"plan": text}),
+        )
+        return _DecisionObservation.from_text(_SEND_REVIEW_PLAN["observation"])
+
+
+class SendReviewPlanTool(ToolDefinition[SendReviewPlanAction, _DecisionObservation]):
+    @classmethod
+    def create(cls, conv_state=None, **params) -> Sequence["SendReviewPlanTool"]:
+        return [
+            cls(
+                name="send_review_plan",
+                description=_SEND_REVIEW_PLAN["tool"],
+                action_type=SendReviewPlanAction,
+                observation_type=_DecisionObservation,
+                executor=_SendReviewPlanExecutor(),
+            )
+        ]
+
+
+register_tool("SendReviewPlanTool", SendReviewPlanTool)
+
+
 def plan_decision_tools(_phase: str) -> list[Tool]:
     return [
-        Tool(name="FinishOrientTool"),
         Tool(name="ChooseWorkModeTool"),
         Tool(name="ChooseOrgModeTool"),
         Tool(name="WritePlanTool"),
@@ -469,10 +536,35 @@ def plan_decision_tools(_phase: str) -> list[Tool]:
     ]
 
 
-def language_decision_tools() -> list[Tool]:
-    """兼容旧名。"""
-    return plan_decision_tools("write_plan")
+def root_decision_tools(phase: str) -> list[Tool]:
+    """根的决定工具一次给全。同一段对话里不能中途拿掉工具。"""
+    del phase
+    names = [
+        "SendNextTool",
+        "ContinueChildTool",
+        "AnswerChildQuestionTool",
+    ]
+    return [Tool(name=name) for name in names]
 
 
-def self_work_decision_tools() -> list[Tool]:
-    return [Tool(name="AskParentTool")]
+def reviewer_decision_tools(phase: str) -> list[Tool]:
+    """负责人的决定工具一次给全，中途不能拿掉。队员只有交回和提问。"""
+    if phase in {"member_check", "member_return", "waiting"}:
+        names = ["ReturnToParentTool", "AskParentTool"]
+    else:
+        names = [
+            "SendReviewPlanTool",
+            "ReturnToParentTool",
+            "AnswerChildQuestionTool",
+        ]
+    return [Tool(name=name) for name in names]
+
+
+def designer_decision_tools(phase: str) -> list[Tool]:
+    """设计的决定工具一次给全。同一段对话里不能中途拿掉工具。"""
+    del phase
+    names = [
+        "FinishDesignTool",
+        "AnswerChildQuestionTool",
+    ]
+    return [Tool(name=name) for name in names]

@@ -17,6 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import unquote
 
 from Agents.v3.config import (
     DEFAULT_MAX_PARALLEL_PLAN,
@@ -71,15 +72,27 @@ class TreeSource:
         return {node.id for node in select_batch(tree, runnable(tree), self.cfg)}
 
 
-def _node_summary(node: Node, working: set[str]) -> dict[str, Any]:
+def _active_slots(tree: Tree) -> dict[str, str]:
+    """根当前派着的设计、开发、验收。换过轮的旧人仍留在树上，但不算当前。"""
+    workspace = tree.root.active_workspace()
+    group = workspace.group if workspace is not None else None
+    if group is None:
+        return {}
+    return {slot.node_type: slot.node_id for slot in group.slots}
+
+
+def _node_summary(node: Node, working: set[str], active: dict[str, str]) -> dict[str, Any]:
     workspace = node.active_workspace()
     return {
         "id": node.id,
         "parent_id": node.parent_id,
         "title": node.title,
+        "node_type": node.node_type,
+        "review_role": node.review_role,
         "status": node.status,
         "phase": node.phase(),
         "children_ids": node.children_ids,
+        "current": active.get(node.node_type) == node.id or node.node_type == "root",
         "workspace": (
             {
                 "id": workspace.id,
@@ -99,14 +112,17 @@ def tree_payload(source: TreeSource) -> dict[str, Any]:
     if tree is None:
         return {"ready": False, "message": f"等待首次落盘：{source.dump_path}"}
     working = source.working_ids(tree)
+    active = _active_slots(tree)
     return {
         "ready": True,
         "root_id": tree.root_id,
         "root_brief": tree.root_brief,
+        "plan_version": tree.plan_version,
+        "usage_for_version": tree.usage_for_version,
         "finished": source.run_ended(tree),
         "updated_at": mtime,
         "nodes": {
-            node_id: _node_summary(node, working)
+            node_id: _node_summary(node, working, active)
             for node_id, node in tree.nodes.items()
         },
     }
@@ -120,6 +136,8 @@ def node_payload(source: TreeSource, node_id: str) -> Optional[dict[str, Any]]:
     return {
         "id": node.id,
         "title": node.title,
+        "node_type": node.node_type,
+        "review_role": node.review_role,
         "status": node.status,
         "phase": node.phase(),
         "from_parent": tree.from_parent(node),
@@ -132,6 +150,7 @@ def node_payload(source: TreeSource, node_id: str) -> Optional[dict[str, Any]]:
                 "org_mode": ws.org_mode,
                 "failure_summary": ws.failure_summary,
                 "plan": ws.plan,
+                "inbox": ws.inbox,
                 "questions": [q.model_dump() for q in ws.questions],
                 "child_reports": [r.model_dump() for r in ws.child_reports],
             }
@@ -158,7 +177,7 @@ def _make_handler(source: TreeSource) -> type[BaseHTTPRequestHandler]:
             self._send(status, body, "application/json; charset=utf-8")
 
         def do_GET(self) -> None:  # noqa: N802 - http.server API
-            path = self.path.split("?", 1)[0]
+            path = unquote(self.path.split("?", 1)[0])
             if path in {"/", "/index.html"}:
                 self._send(
                     HTTPStatus.OK, _INDEX_HTML.read_bytes(), "text/html; charset=utf-8"

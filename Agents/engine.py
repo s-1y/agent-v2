@@ -185,6 +185,101 @@ class _GluedTerminalTool(TerminalTool):
 register_tool(TerminalTool.name, _GluedTerminalTool)
 
 
+_META_KEYS = {"security_risk", "summary"}
+_SCHEMA_CACHE: dict[str, tuple[set[str], set[str]] | None] = {}
+_CLASS_BY_NAME: dict | None = None
+
+
+def _action_model(cls):
+    """从工具类的泛型参数里取出参数模型，不真正创建工具。"""
+    from openhands.sdk.tool.tool import Action
+
+    if cls is None:
+        return None
+    for klass in getattr(cls, "__mro__", ()):
+        meta = getattr(klass, "__pydantic_generic_metadata__", None) or {}
+        args = meta.get("args") or ()
+        candidate = args[0] if args else None
+        if isinstance(candidate, type) and issubclass(candidate, Action):
+            return candidate
+    return None
+
+
+def _tool_classes_by_runtime_name() -> dict:
+    import importlib
+    import inspect
+
+    from openhands.sdk.tool.registry import get_tool_module_qualnames
+    from openhands.sdk.tool.tool import ToolDefinition
+
+    global _CLASS_BY_NAME
+    if _CLASS_BY_NAME is not None:
+        return _CLASS_BY_NAME
+    found = {}
+    for module_name in set(get_tool_module_qualnames().values()):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        for _, cls in inspect.getmembers(module, inspect.isclass):
+            if not issubclass(cls, ToolDefinition) or cls is ToolDefinition:
+                continue
+            runtime_name = getattr(cls, "name", "")
+            if runtime_name and runtime_name not in found:
+                found[runtime_name] = cls
+    _CLASS_BY_NAME = found
+    return found
+
+
+def _tool_argument_schema(name: str) -> tuple[set[str], set[str]] | None:
+    """这个工具必填、可选的参数名。看不出形状就不当成可识别。"""
+    if name in _SCHEMA_CACHE:
+        return _SCHEMA_CACHE[name]
+    schema: tuple[set[str], set[str]] | None = None
+    try:
+        action = _action_model(_tool_classes_by_runtime_name().get(name))
+        if action is not None:
+            required: set[str] = set()
+            optional: set[str] = set()
+            for field_name, field_info in action.model_fields.items():
+                if field_name in _META_KEYS:
+                    continue
+                if field_info.is_required():
+                    required.add(field_name)
+                else:
+                    optional.add(field_name)
+            schema = (required, optional)
+    except Exception:
+        schema = None
+    _SCHEMA_CACHE[name] = schema
+    return schema
+
+
+def _unique_tool_for_arguments(arguments: dict, available_tools) -> str | None:
+    """参数形状只可能属于一个现有工具时，返回那个注册名。
+
+    必填项盖得最严的那个才算。空参数对得上好几种“做完了”的工具，不猜。
+    """
+    provided = {key for key in arguments if key not in _META_KEYS}
+    if not provided:
+        return None
+    best: list[tuple[int, str]] = []
+    for name in available_tools:
+        schema = _tool_argument_schema(str(name))
+        if schema is None:
+            continue
+        required, optional = schema
+        if not required <= provided or not provided <= (required | optional):
+            continue
+        best.append((len(required), str(name)))
+    if not best:
+        return None
+    best.sort(reverse=True)
+    if len(best) == 1 or best[0][0] > best[1][0]:
+        return best[0][1]
+    return None
+
+
 def _install_tool_name_glue() -> None:
     """叫错的工具名，只有参数已经能对上现有工具时才改过去。
 
@@ -232,6 +327,16 @@ def _install_tool_name_glue() -> None:
                 if src in args and dst not in args:
                     args[dst] = args.pop(src)
         out_name, out_args = original(name, args, available_tools)
+        if out_name == tool_name and out_name not in available_tools:
+            matched = _unique_tool_for_arguments(args, available_tools)
+            if matched:
+                out_name, out_args = original(matched, args, available_tools)
+            else:
+                shown = "、".join(sorted(str(item) for item in available_tools))
+                raise ValueError(
+                    f"你在调用工具，但 `{tool_name}` 不是可用的名字。"
+                    f"能用的是：{shown}"
+                )
         if out_name == tool_name:
             return out_name, out_args
         if out_name == "file_editor":
@@ -311,6 +416,81 @@ def release_browser(conversation) -> None:
     _BROWSER_LEASE.release(conversation, _close_shared_browser)
 
 
+def _is_shell_launcher(path: Path) -> bool:
+    """脚本和 snap 包装都会自己退出，browser-use 会以为浏览器没起来。"""
+    if "/snap/" in path.as_posix() or path.name == "chromium-browser":
+        return True
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(2)
+    except OSError:
+        return True
+    return head == b"#!"
+
+
+def _playwright_chromium() -> Path | None:
+    """本机 Playwright 缓存里的 Chrome。版本号取最大的一份。"""
+    caches = [
+        Path.home() / ".cache" / "ms-playwright",
+        Path.home() / "Library" / "Caches" / "ms-playwright",
+    ]
+    relatives = (
+        "chrome-linux64/chrome",
+        "chrome-linux/chrome",
+        "chrome-win64/chrome.exe",
+        "chrome-win/chrome.exe",
+        "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        "chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+    )
+    found: list[tuple[int, Path]] = []
+    for cache in caches:
+        if not cache.is_dir():
+            continue
+        for directory in cache.glob("chromium-*"):
+            suffix = directory.name.removeprefix("chromium-")
+            version = int(suffix) if suffix.isdigit() else 0
+            for relative in relatives:
+                candidate = directory / relative
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    found.append((version, candidate))
+    if not found:
+        return None
+    found.sort()
+    return found[-1][1]
+
+
+def _install_browser_binary() -> None:
+    """用 Playwright 的 Chrome，并关掉沙箱。系统的 chromium-browser 是 snap 脚本，进程会在调试端口打开前退出。"""
+    from openhands.tools.browser_use.impl import BrowserToolExecutor
+
+    if getattr(BrowserToolExecutor, "_meta_agent_chromium", False):
+        return
+    original = BrowserToolExecutor.check_chromium_available
+    playwright = _playwright_chromium()
+
+    def check_chromium_available() -> str | None:
+        if playwright is not None and playwright.is_file():
+            return str(playwright)
+        found = original()
+        if found and _is_shell_launcher(Path(found)):
+            return None
+        return found
+
+    original_init = BrowserToolExecutor.__init__
+
+    def __init__(self, *args, **kwargs):
+        # 这台系统关了非特权用户命名空间。Playwright 的 Chrome 不带 --no-sandbox 会立刻退出。
+        kwargs["chromium_sandbox"] = False
+        if playwright is not None:
+            kwargs["executable_path"] = str(playwright)
+        original_init(self, *args, **kwargs)
+
+    BrowserToolExecutor.check_chromium_available = staticmethod(check_chromium_available)  # type: ignore[method-assign]
+    BrowserToolExecutor.__init__ = __init__  # type: ignore[method-assign]
+    BrowserToolExecutor._meta_agent_chromium = True
+
+
 def _install_browser_lease() -> None:
     from openhands.tools.browser_use.impl import BrowserToolExecutor
 
@@ -326,6 +506,7 @@ def _install_browser_lease() -> None:
     BrowserToolExecutor._meta_agent_lease = True
 
 
+_install_browser_binary()
 _install_browser_lease()
 
 
@@ -405,6 +586,14 @@ def readonly_tools() -> list[Tool]:
     ]
 
 
+def result_view_tools() -> list[Tool]:
+    """验收只用终端和浏览器，按用法去操作。没有读文件、搜索和编辑器。"""
+    return [
+        Tool(name=TerminalTool.name),
+        Tool(name=BrowserToolSet.name),
+    ]
+
+
 def run_agent(
     task: str,
     workspace: WorkspacePath,
@@ -460,6 +649,7 @@ __all__ = [
     "ReadFileTool",
     "coding_tools",
     "readonly_tools",
+    "result_view_tools",
     "create_mcp_tools",
     "load_project_skills",
     "load_skills_from_dir",

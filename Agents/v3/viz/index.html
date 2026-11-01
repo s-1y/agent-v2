@@ -8,6 +8,7 @@
     --bg: #f6f7f9; --card: #fff; --line: #c9ced6; --text: #1f2328; --muted: #6e7781;
     --running: #0969da; --waiting: #bf8700; --staged: #8c959f; --finished: #1a7f37;
     --working: #cf222e;
+    --role-root: #24292f; --role-plan: #8250df; --role-worker: #0969da; --role-review: #bf3989;
   }
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
@@ -58,6 +59,13 @@
   .badge.finished { background: #dafbe1; color: var(--finished); }
   .badge.org { background: #ddf4ff; color: var(--running); }
   .badge.work { background: var(--working); color: #fff; font-weight: 600; }
+  .badge.role { color: #fff; }
+  .badge.role.r-root { background: var(--role-root); }
+  .badge.role.r-designer { background: var(--role-plan); }
+  .badge.role.r-agent { background: var(--role-worker); }
+  .badge.role.r-reviewer { background: var(--role-review); }
+  .badge.role.r-member { background: #9a6700; }
+  .badge.current { background: #fff8c5; color: #4d2d00; }
 
   #detail h2 { font-size: 16px; margin: 0 0 8px; }
   #detail h3 { font-size: 14px; margin: 18px 0 6px; }
@@ -81,7 +89,54 @@
   <section id="detail"><div class="empty">点击左侧节点查看 plan 和详情。</div></section>
 </main>
 <script>
+const PHASE_LABEL = {
+  root_1_look: "看要求",
+  root_2_send_doc: "派设计",
+  root_3_send_build: "派开发",
+  root_6_send_review: "派验收",
+  root_7_send_revise: "交改进建议",
+  "7_answer_question": "回答提问",
+  "1_complete_requirement": "补全要求",
+  "2_write_plan": "写第一版手册",
+  "1A_read_review": "对接验收",
+  "2A_write_revision": "写改进手册",
+  "1_orient": "认任务",
+  "2_choose_work_mode": "自己做或分工",
+  "3A_self_work": "自己做",
+  "3A2_summarize": "写总结",
+  "3B_choose_org_mode": "选组织方式",
+  "4A1_design_sequence": "想顺序分工",
+  "4A2_write_sequence_plan": "写顺序计划",
+  "4B1_design_parallel": "想并行分工",
+  "4B2_write_parallel_plan": "写并行计划",
+  "5_create_group": "建组",
+  "6_dispatch": "下发",
+  "8_review": "收回开发",
+  "9_worker_final": "交用法",
+  leader_1_look: "看交付物",
+  leader_2_plan: "想划分",
+  leader_3_dispatch: "下发核验",
+  leader_4_answer: "回答队员",
+  leader_5_filter: "筛选",
+  member_check: "检查",
+  member_return: "归类提交",
+  waiting: "等待",
+};
+
 const REFRESH_MS = 20000;
+
+function roleOf(n) {
+  if (n.node_type === "reviewer" && n.review_role === "member") return ["r-member", "队员"];
+  if (n.node_type === "reviewer") return ["r-reviewer", "验收"];
+  if (n.node_type === "designer") return ["r-designer", "设计"];
+  if (n.node_type === "root") return ["r-root", "根"];
+  return ["r-agent", "开发"];
+}
+
+function phaseText(phase) {
+  const label = PHASE_LABEL[phase];
+  return label ? `${label}` : phase;
+}
 let selectedId = null;
 let nextAt = 0;
 
@@ -93,14 +148,19 @@ function el(tag, cls, text) {
 }
 
 function nodeCard(n) {
+  const name = n.title || n.id;
   const card = el("div", `node s-${n.status}` + (n.working ? " working" : "") +
                          (n.id === selectedId ? " selected" : ""));
-  card.appendChild(el("span", "id", n.id));
-  card.appendChild(el("span", "title", n.title || "root"));
+  card.dataset.id = n.id;
+  card.appendChild(el("span", "title", name));
+  const role = roleOf(n);
+  card.appendChild(el("span", `badge role ${role[0]}`, role[1]));
+  if (n.current && n.node_type !== "root") card.appendChild(el("span", "badge current", "当前"));
+  if (n.id !== name) card.appendChild(el("span", "id", n.id));
   if (n.status === "finished") {
-    card.appendChild(el("span", "badge finished", "finished"));
+    card.appendChild(el("span", "badge finished", "已结束"));
   } else {
-    card.appendChild(el("span", "badge phase", n.phase));
+    card.appendChild(el("span", "badge phase", phaseText(n.phase)));
   }
   const ws = n.workspace;
   if (ws && ws.org_mode) card.appendChild(el("span", "badge org", ws.org_mode));
@@ -142,8 +202,10 @@ async function loadTree() {
   state.className = "state " + (data.finished ? "done" : "live");
   const working = Object.values(data.nodes).filter(n => n.working).map(n => n.id);
   document.getElementById("meta").textContent =
-    `落盘于 ${new Date(data.updated_at * 1000).toLocaleTimeString()} · ` +
-    `${Object.keys(data.nodes).length} 个节点 · working: ${working.join(", ") || "无"}`;
+    `计划 ver${data.plan_version}` +
+    (data.usage_for_version ? ` · 用法已交到 ver${data.usage_for_version}` : "") +
+    ` · 落盘于 ${new Date(data.updated_at * 1000).toLocaleTimeString()} · ` +
+    `${Object.keys(data.nodes).length} 个节点 · 正在跑: ${working.join(", ") || "无"}`;
   document.getElementById("brief").textContent = "要求：" + data.root_brief;
   document.getElementById("brief").title = data.root_brief;
 
@@ -155,9 +217,8 @@ async function loadTree() {
 
 function select(id) {
   selectedId = id;
-  document.querySelectorAll(".node.selected").forEach(e => e.classList.remove("selected"));
   document.querySelectorAll(".node").forEach(e => {
-    if (e.querySelector(".id").textContent === id) e.classList.add("selected");
+    e.classList.toggle("selected", e.dataset.id === id);
   });
   loadDetail(id);
 }
@@ -181,15 +242,18 @@ async function loadDetail(id) {
   }
   if (id !== selectedId) return;
   const out = document.createDocumentFragment();
-  out.appendChild(el("h2", null, `${d.id} ${d.title || "root"}`));
-  out.appendChild(el("div", "kv", `status: ${d.status} · phase: ${d.phase}`));
+  const role = roleOf(d);
+  out.appendChild(el("h2", null, `${d.title || d.id}`));
+  out.appendChild(el("div", "kv",
+    `${role[1]} · ${d.id} · status: ${d.status} · ${phaseText(d.phase)}`));
 
-  if (!d.workspaces.length) out.appendChild(el("p", "empty", "还没有工作区（尚未写 plan）。"));
+  if (!d.workspaces.length) out.appendChild(el("p", "empty", "还没有工作区。"));
   for (const ws of d.workspaces.slice().reverse()) {
     const block = el("div", "ws");
     const mode = [ws.work_mode, ws.org_mode].filter(Boolean).join(" / ");
     block.appendChild(el("h3", null, `工作区 ${ws.id} · ${ws.status}` + (mode ? ` · ${mode}` : "")));
     section(block, "失败总结", ws.failure_summary);
+    section(block, "系统按顺序拼好的核验记录", ws.inbox);
     if (ws.plan && ws.plan.trim()) {
       section(block, "Plan", ws.plan);
     } else {

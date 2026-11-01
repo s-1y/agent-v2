@@ -6,12 +6,14 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 
-DEFAULT_MAX_TURNS = 40
+DEFAULT_MAX_TURNS = 200
+# 1 = 只做第一版，验收后停。3 = 第一版再改进两次。
+DEFAULT_REPEAT = 1
 DEFAULT_DUMP_EVERY = 1
 # OpenHands LLMSummarizingCondenser default max_size.
 DEFAULT_CONDENSE_EVERY = 240
 DEFAULT_MAX_PARALLEL_PLAN = 4
-DEFAULT_MAX_PARALLEL_SELF_WORK = 1
+DEFAULT_MAX_PARALLEL_SELF_WORK = 4
 DEFAULT_MAX_SELF_ITERATIONS = 120
 POSITION_SUMMARY_MAX_CHARS = 40
 CHAIN_POSITION_MAX_CHARS = 180
@@ -20,6 +22,7 @@ CHAIN_POSITION_MAX_CHARS = 180
 @dataclass
 class Config:
     max_turns: int = DEFAULT_MAX_TURNS
+    repeat: int = DEFAULT_REPEAT
     dump_every: int = DEFAULT_DUMP_EVERY
     condense_every: int = DEFAULT_CONDENSE_EVERY
     max_parallel_plan: int = DEFAULT_MAX_PARALLEL_PLAN

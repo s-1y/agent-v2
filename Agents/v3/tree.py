@@ -12,16 +12,15 @@ import json
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, model_validator
 
-NodeType = Literal["agent"]
+NodeType = Literal["agent", "root", "designer", "reviewer"]
 Status = Literal["staged", "running", "waiting", "finished"]
 WorkMode = Literal["self", "delegate"]
 OrgMode = Literal["sequence", "parallel"]
 WorkspaceStatus = Literal[
     "choosing_work_mode",
     "choosing_org_mode",
-    "planning",
     "planning_self",
     "summarizing_self",
     "designing_sequence",
@@ -33,6 +32,26 @@ WorkspaceStatus = Literal[
     "dispatched",
     "review",
     "closed",
+    "worker_final",
+    "reviewer_look",
+    "reviewer_plan",
+    "reviewer_dispatch",
+    "reviewer_filter",
+    "member_check",
+    "member_return",
+    "designer_revise_look",
+    "designer_revise",
+    "root_look",
+    "root_send_doc",
+    "root_wait_doc",
+    "root_send_build",
+    "root_wait_build",
+    "root_send_review",
+    "root_wait_review",
+    "root_send_revise",
+    "root_wait_usage",
+    "designer_requirement",
+    "designer_write",
 ]
 GroupKind = Literal["parallel", "sequence"]
 GroupStatus = Literal["staged", "dispatched", "closed"]
@@ -80,13 +99,14 @@ class Workspace(BaseModel):
     failure_summary: str = ""
     plan: str = ""
     position: str = ""  # harness 生成的短路标，只用于给新成员一次性说明树中位置
-    status: WorkspaceStatus = "planning"
+    status: WorkspaceStatus = "choosing_work_mode"
     work_mode: Optional[WorkMode] = None
     org_mode: Optional[OrgMode] = None
     group: Optional[NodeGroup] = None
     question_seq: int = 0
     questions: list[ChildQuestion] = Field(default_factory=list)
     child_reports: list[ChildReport] = Field(default_factory=list)
+    inbox: str = ""  # 系统按顺序拼好、交回负责人的核验记录
 
 
 class Node(BaseModel):
@@ -99,6 +119,8 @@ class Node(BaseModel):
     from_parent: str = ""
     position: str = ""  # harness 生成的短定位，避免逐层展开祖先 plan
     status: Status = "running"
+    order: int = 0  # 创建顺序，用来在同一层里排先后
+    review_role: Literal["", "leader", "member"] = ""
 
     # 任务节点专有
     children_ids: list[str] = Field(default_factory=list)
@@ -106,14 +128,6 @@ class Node(BaseModel):
 
     # 最近一次向上级返回的话
     return_message: str = ""
-
-    @field_validator("node_type", mode="before")
-    @classmethod
-    def _coerce_legacy_language(cls, value: Any) -> Any:
-        # 旧树 dumps 里曾用 language/plan/code，新系统统一视为 agent。
-        if value in {"language", "plan", "code"}:
-            return "agent"
-        return value
 
     def active_workspace(self) -> Optional[Workspace]:
         for workspace in reversed(self.workspaces):
@@ -153,8 +167,8 @@ class Node(BaseModel):
             return "4B1_design_parallel"
         if workspace.status == "planning_parallel":
             return "4B2_write_parallel_plan"
-        if workspace.status == "planning":
-            return "write_plan"
+        if workspace.status == "worker_final":
+            return "9_worker_final"
         if workspace.status == "planned":
             return "5_create_group"
         if workspace.status == "group_created":
@@ -164,17 +178,102 @@ class Node(BaseModel):
         return "waiting"
 
 
+class Root(Node):
+    """听人的原话，派设计、开发、验收。不写计划，不自己做。"""
+
+    node_type: Literal["root"] = "root"
+
+    def phase(self) -> str:
+        if self.open_question() is not None:
+            return "7_answer_question"
+        workspace = self.active_workspace()
+        if workspace is None:
+            return "root_1_look"
+        status = workspace.status
+        if status == "root_look":
+            return "root_1_look"
+        if status == "root_send_doc":
+            return "root_2_send_doc"
+        if status == "root_send_build":
+            return "root_3_send_build"
+        if status == "root_send_review":
+            return "root_6_send_review"
+        if status == "root_send_revise":
+            return "root_7_send_revise"
+        return "waiting"
+
+
+class Designer(Node):
+    """写内部计划文档的人。先补全要求，再把文档写到 .meta_agent。"""
+
+    node_type: Literal["designer"] = "designer"
+
+    def phase(self) -> str:
+        if self.open_question() is not None:
+            return "7_answer_question"
+        workspace = self.active_workspace()
+        if workspace is None or workspace.status == "designer_requirement":
+            return "1_complete_requirement"
+        if workspace.status == "designer_write":
+            return "2_write_plan"
+        if workspace.status == "designer_revise_look":
+            return "1A_read_review"
+        if workspace.status == "designer_revise":
+            return "2A_write_revision"
+        return "waiting"
+
+
+class Reviewer(Node):
+    """验收。负责人划分并筛选；队员只核验自己那一部分，不再往下派。"""
+
+    node_type: Literal["reviewer"] = "reviewer"
+
+    def phase(self) -> str:
+        if self.open_question() is not None and self.review_role == "leader":
+            return "leader_4_answer"
+        workspace = self.active_workspace()
+        if self.review_role == "member":
+            if workspace is None or workspace.status == "member_check":
+                return "member_check"
+            if workspace.status == "member_return":
+                return "member_return"
+            return "waiting"
+        if workspace is None or workspace.status == "reviewer_look":
+            return "leader_1_look"
+        if workspace.status == "reviewer_plan":
+            return "leader_2_plan"
+        if workspace.status == "reviewer_dispatch":
+            return "leader_3_dispatch"
+        if workspace.status == "reviewer_filter":
+            return "leader_5_filter"
+        return "waiting"
+
+
 class Tree(BaseModel):
-    root_id: str = "n0"
+    root_id: str = "Root"
     root_brief: str = ""  # 人给的要求，就是根的 from_parent
     nodes: dict[str, Node] = Field(default_factory=dict)
     seq: int = 0
+    plan_version: int = 1
+    delivery: str = ""  # 开发负责人交回的用法
+    review_note: str = ""  # 验收负责人筛选后的改进建议
+    usage_for_version: int = 0  # 已经问过用法的计划版本
 
     # --- 基本操作 ---
 
-    def new_id(self) -> str:
-        self.seq += 1
-        return f"n{self.seq}"
+    def display_name(self, node_type: NodeType) -> str:
+        """对外名字。Root 和 Plan 各只有一个，不编号。开发从 Worker 0 起。"""
+        if node_type == "root":
+            return "Root"
+        if node_type == "designer":
+            return "Plan"
+        if node_type == "agent":
+            taken = sum(1 for node in self.nodes.values() if node.node_type == "agent")
+            return f"Worker {taken}"
+        taken = sum(1 for node in self.nodes.values() if node.node_type == "reviewer")
+        if taken == 0:
+            return "Reviewer"
+        return f"Reviewer {taken - 1}"
 
     @property
     def root(self) -> Node:
@@ -205,12 +304,15 @@ class Tree(BaseModel):
 
     # --- 生长 ---
 
-    def create_root(self, brief: str) -> Node:
+    def create_root(self, brief: str) -> Root:
         self.root_brief = brief
-        root = Node(
+        root = Root(
             id=self.root_id,
-            title="root",
+            title="Root",
             from_parent=brief,
+            workspaces=[
+                Workspace(id="w1", status="root_look"),
+            ],
         )
         self.nodes[root.id] = root
         return root
@@ -224,14 +326,33 @@ class Tree(BaseModel):
         from_parent: str = "",
         status: Status = "staged",
     ) -> Node:
-        child = Node(
-            id=self.new_id(),
+        kind = {
+            "designer": Designer,
+            "reviewer": Reviewer,
+            "root": Root,
+        }.get(node_type, Node)
+        name = self.display_name(node_type)
+        self.seq += 1
+        child = kind(
+            id=name,
             parent_id=parent.id,
-            node_type=node_type,
-            title=title,
+            title=name,
+            order=self.seq,
             from_parent=from_parent,
             status=status,
+            review_role=(
+                "member"
+                if node_type == "reviewer" and isinstance(parent, Reviewer)
+                else "leader"
+                if node_type == "reviewer"
+                else ""
+            ),
         )
+        if isinstance(child, Designer):
+            child.workspaces.append(Workspace(id="w1", status="designer_requirement"))
+        elif isinstance(child, Reviewer):
+            initial = "member_check" if child.review_role == "member" else "reviewer_look"
+            child.workspaces.append(Workspace(id="w1", status=initial))
         self.nodes[child.id] = child
         parent.children_ids.append(child.id)
         return child
@@ -244,6 +365,31 @@ class Tree(BaseModel):
             json.dumps(self.model_dump(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _keep_root_class(cls, data: Any) -> Any:
+        """node_type 为 root 时读回 Root，不要收成普通节点。"""
+        if not isinstance(data, dict):
+            return data
+        nodes = data.get("nodes")
+        if not isinstance(nodes, dict):
+            return data
+        parsed: dict[str, Any] = {}
+        for key, value in nodes.items():
+            if isinstance(value, Node):
+                parsed[key] = value
+            elif isinstance(value, dict) and value.get("node_type") == "root":
+                parsed[key] = Root.model_validate(value)
+            elif isinstance(value, dict) and value.get("node_type") == "designer":
+                parsed[key] = Designer.model_validate(value)
+            elif isinstance(value, dict) and value.get("node_type") == "reviewer":
+                parsed[key] = Reviewer.model_validate(value)
+            else:
+                parsed[key] = value
+        data = dict(data)
+        data["nodes"] = parsed
+        return data
 
     @classmethod
     def load(cls, path: Path) -> "Tree":

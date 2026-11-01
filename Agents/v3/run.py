@@ -20,6 +20,7 @@ from Agents.v3.config import (
     DEFAULT_MAX_PARALLEL_SELF_WORK,
     DEFAULT_MAX_SELF_ITERATIONS,
     DEFAULT_MAX_TURNS,
+    DEFAULT_REPEAT,
     CHAIN_POSITION_MAX_CHARS,
     POSITION_SUMMARY_MAX_CHARS,
     Config,
@@ -64,6 +65,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--brief-file", help="从文件里读要求。")
     parser.add_argument("--workspace", help="工作区目录，默认 workspace/v3/<run_id>。")
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=DEFAULT_REPEAT,
+        help="做完这么多版就停。1 是只做第一版；3 是第一版再改进两次。最后一版的验收打在命令行上。",
+    )
     parser.add_argument("--dump-every", type=int, default=DEFAULT_DUMP_EVERY)
     parser.add_argument(
         "--condense-every",
@@ -88,25 +95,51 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--viz-host", default="127.0.0.1")
     parser.add_argument("--viz-port", type=int, default=8765)
+    parser.add_argument(
+        "--resume-run",
+        help="接上 logging/v3/<run_id>.tree.json 继续。必须带当时的 --workspace。回合从 0 另计。",
+    )
     args = parser.parse_args(argv)
 
-    if args.brief_file:
-        brief = Path(args.brief_file).read_text(encoding="utf-8").strip()
-    elif args.brief:
-        brief = args.brief
-    else:
-        parser.error("需要 --brief 或 --brief-file")
+    if args.repeat < 1:
+        parser.error("--repeat 至少是 1")
 
-    run_id = time.strftime("%Y%m%d-%H%M%S")
-    workspace = Path(args.workspace) if args.workspace else REPO_ROOT / "workspace" / "v2" / run_id
-    workspace.mkdir(parents=True, exist_ok=True)
-    log_dir = REPO_ROOT / "logging" / "v2"
+    log_dir = REPO_ROOT / "logging" / "v3"
     log_dir.mkdir(parents=True, exist_ok=True)
+    if args.resume_run:
+        if not args.workspace:
+            parser.error("接上旧运行时必须带当时的 --workspace")
+        run_id = args.resume_run
+        dump_path = log_dir / f"{run_id}.tree.json"
+        if not dump_path.is_file():
+            parser.error(f"找不到 {dump_path}")
+        tree = Tree.load(dump_path)
+        brief = tree.root_brief
+        workspace = Path(args.workspace)
+        if not workspace.is_dir():
+            parser.error(f"工作区不存在：{workspace}")
+    else:
+        if args.brief_file:
+            brief = Path(args.brief_file).read_text(encoding="utf-8").strip()
+        elif args.brief:
+            brief = args.brief
+        else:
+            parser.error("需要 --brief 或 --brief-file")
+        run_id = time.strftime("%Y%m%d-%H%M%S")
+        workspace = (
+            Path(args.workspace)
+            if args.workspace
+            else REPO_ROOT / "workspace" / "v3" / run_id
+        )
+        workspace.mkdir(parents=True, exist_ok=True)
+        dump_path = log_dir / f"{run_id}.tree.json"
+        tree = Tree()
+        tree.create_root(brief)
     log_path = log_dir / f"{run_id}.log"
-    dump_path = log_dir / f"{run_id}.tree.json"
 
     cfg = Config(
         max_turns=args.max_turns,
+        repeat=args.repeat,
         dump_every=args.dump_every,
         condense_every=args.condense_every,
         max_parallel_plan=args.max_parallel_plan,
@@ -116,9 +149,6 @@ def main(argv: list[str] | None = None) -> int:
         chain_summarizer=_chain_summarizer,
         run_id=run_id,
     )
-
-    tree = Tree()
-    tree.create_root(brief)
 
     handle = log_path.open("a", encoding="utf-8")
     steps_handle = (log_dir / f"{run_id}.steps.jsonl").open("a", encoding="utf-8")
@@ -136,6 +166,9 @@ def main(argv: list[str] | None = None) -> int:
     say(f"工作区 {workspace}")
     say(f"运行   {run_id}")
     say(f"要求   {brief}")
+    say(f"轮数   {args.repeat}（第 1 版设计，之后改进 {args.repeat - 1} 次）")
+    if args.resume_run:
+        say(f"接上   根在 {tree.get(tree.root_id).phase()}，计划第 {tree.plan_version} 版")
     if args.viz:
         from Agents.v3.viz.server import start_viz_server
 

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from Agents.v3.tree import Node, Tree
+from Agents.v3.session import plan_doc_path
+from Agents.v3.tree import Designer, Node, Reviewer, Root, Tree
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 PHASE_PROMPT_DIR = PROMPT_DIR / "phases"
@@ -13,22 +14,43 @@ _EMPTY = "（还没有）"
 _STATE_CAP = 6000
 
 
-def load(name: str) -> str:
-    return (PROMPT_DIR / f"{name}.md").read_text(encoding="utf-8").strip()
+def prompt_role(node: Node) -> str:
+    if isinstance(node, Root):
+        return "manager"
+    if isinstance(node, Designer):
+        return "designer"
+    if isinstance(node, Reviewer):
+        if node.review_role == "member":
+            return "reviewer/member"
+        return "reviewer/leader"
+    return "worker"
 
 
-def load_phase(name: str) -> str:
-    path = PHASE_PROMPT_DIR / f"{name}.md"
+def load_phase(name: str, role: str = "worker") -> str:
+    path = PHASE_PROMPT_DIR / role / f"{name}.md"
     if not path.is_file():
         return ""
     return path.read_text(encoding="utf-8").strip()
 
 
-def fill(name: str, **values: str) -> str:
-    text = load(name)
-    for key, value in values.items():
-        text = text.replace("{{" + key + "}}", value or _EMPTY)
-    return text
+WORKER_FINAL_PHASE = "9_worker_final"
+
+
+def worker_final_prompt() -> str:
+    """问开发负责人怎么用、怎么看结果。不讲代码。"""
+    return load_phase(WORKER_FINAL_PHASE, "worker")
+
+
+def _plan_doc_section(
+    node: Node, project_root: str, run_id: str, version: int = 1
+) -> str:
+    """根和验收不看内部计划。同一次运行里的其余人收到当前这一版的文件夹。"""
+    if not project_root or isinstance(node, (Root, Reviewer)):
+        return ""
+    return (
+        "## 内部计划文档\n\n"
+        f"文件夹：{plan_doc_path(project_root, run_id, version)}\n\n"
+    )
 
 
 def _render_chain_raw(tree: Tree, node: Node) -> str:
@@ -92,7 +114,7 @@ def render_chain(tree: Tree, node: Node) -> str:
 def _workspace_state(tree: Tree, node: Node, *, include_plan: bool = True) -> str:
     workspace = node.active_workspace()
     if workspace is None:
-        return "当前还没有工作区。请先理解任务并 write_plan。"
+        return "当前还没有工作区。"
 
     lines = [
         f"工作区：{workspace.id}",
@@ -104,6 +126,11 @@ def _workspace_state(tree: Tree, node: Node, *, include_plan: bool = True) -> st
         lines.append(f"组织方式：{workspace.org_mode}")
     if workspace.failure_summary.strip():
         lines.append(f"之前失败总结：{workspace.failure_summary}")
+
+    if workspace.inbox.strip():
+        lines.append("")
+        lines.append("系统按顺序拼好的核验记录：")
+        lines.append(workspace.inbox.strip())
 
     if workspace.questions:
         lines.append("")
@@ -137,8 +164,9 @@ def _workspace_state(tree: Tree, node: Node, *, include_plan: bool = True) -> st
         lines.append(workspace.plan.strip())
 
     text = "\n".join(lines)
-    if len(text) > _STATE_CAP:
-        text = text[:_STATE_CAP] + "\n……（workspace 状态过长，已截断）"
+    cap = 48000 if workspace.inbox.strip() else _STATE_CAP
+    if len(text) > cap:
+        text = text[:cap] + "\n……（workspace 状态过长，已截断）"
     return text
 
 
@@ -151,7 +179,7 @@ def _common(
         "project_root": project_root,
         "from_parent": tree.from_parent(node),
         "phase": phase,
-        "phase_prompt": load_phase(phase),
+        "phase_prompt": load_phase(phase, prompt_role(node)),
         "workspace_state": _workspace_state(
             tree, node, include_plan=include_plan
         ),
@@ -159,7 +187,12 @@ def _common(
 
 
 def _plan_message(
-    tree: Tree, node: Node, *, resume: bool, project_root: str = ""
+    tree: Tree,
+    node: Node,
+    *,
+    resume: bool,
+    project_root: str = "",
+    run_id: str = "",
 ) -> str:
     values = _common(tree, node, project_root=project_root, include_plan=not resume)
     title = "继续" if resume else "开工"
@@ -192,11 +225,17 @@ def _plan_message(
         if not resume
         else ""
     )
+    handoff = ""
+    if isinstance(node, Root):
+        if node.phase() == "root_6_send_review" and tree.delivery.strip():
+            handoff = f"## 开发交回的使用方式\n\n{tree.delivery.strip()}\n\n"
+        elif node.phase() == "root_7_send_revise" and tree.review_note.strip():
+            handoff = f"## 验收筛选后的改进建议\n\n{tree.review_note.strip()}\n\n"
     return f"""## {title}
 
 你是同一个任务节点。请根据当前阶段行动。
 
-{position}{root}{task}## 当前阶段
+{position}{root}{task}{handoff}{_plan_doc_section(node, project_root, run_id, tree.plan_version)}## 当前阶段
 
 {values["phase"] or _EMPTY}
 
@@ -210,33 +249,43 @@ def _plan_message(
 """.strip()
 
 
-def plan_task(tree: Tree, node: Node, *, project_root: str = "") -> str:
-    return _plan_message(tree, node, resume=False, project_root=project_root)
+def plan_task(
+    tree: Tree, node: Node, *, project_root: str = "", run_id: str = ""
+) -> str:
+    return _plan_message(
+        tree, node, resume=False, project_root=project_root, run_id=run_id
+    )
 
 
-def plan_continue(tree: Tree, node: Node) -> str:
+def plan_continue(
+    tree: Tree, node: Node, *, project_root: str = "", run_id: str = ""
+) -> str:
     """唤醒已有会话时只追加阶段提示。任务和 plan 已在历史里，不再重贴。"""
-    return _plan_message(tree, node, resume=True)
-
-
-def self_work_continue(tree: Tree, node: Node) -> str:
-    return ""
+    return _plan_message(
+        tree, node, resume=True, project_root=project_root, run_id=run_id
+    )
 
 
 def turn_message(
-    tree: Tree, node: Node, *, resume: bool, project_root: str = ""
+    tree: Tree,
+    node: Node,
+    *,
+    resume: bool,
+    project_root: str = "",
+    run_id: str = "",
 ) -> str:
     if resume:
-        return (
-            self_work_continue(tree, node)
-            if node.phase() == "3A_self_work"
-            else plan_continue(tree, node)
+        return plan_continue(
+            tree, node, project_root=project_root, run_id=run_id
         )
-    return plan_task(tree, node, project_root=project_root)
-
-def plan_system() -> str:
-    return load_phase("0_system")
+    return plan_task(tree, node, project_root=project_root, run_id=run_id)
 
 
-def self_work_system() -> str:
-    return load_phase("0_system")
+def plan_system(node: Node | None = None) -> str:
+    role = prompt_role(node) if node is not None else "worker"
+    return load_phase("0_system", role)
+
+
+def root_system() -> str:
+    return load_phase("root_0_system", "manager")
+
