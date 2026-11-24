@@ -62,6 +62,13 @@ from openhands.tools.terminal import TerminalTool  # noqa: E402
 WorkspacePath = Union[str, Path]
 
 
+def _uses_qwen_thinking(model: str, base_url: Optional[str]) -> bool:
+    """百炼千问用 thinking_budget。它和 OpenAI 的 reasoning_effort 不能同时出现。"""
+    name = model.lower()
+    url = (base_url or "").lower()
+    return "qwen" in name or "dashscope" in url or "aliyuncs" in url
+
+
 def make_llm(
     *,
     model: Optional[str] = None,
@@ -77,14 +84,22 @@ def make_llm(
     )
     if not resolved_key:
         raise RuntimeError("LLM_API_KEY is not set")
+    resolved_model = model or os.getenv("LLM_MODEL", "gpt-5.5")
+    resolved_base = base_url if base_url is not None else os.getenv("LLM_BASE_URL") or None
+    # SDK 默认会带 reasoning_effort。千问兼容接口再带 thinking_budget 时会被拒绝。
+    if _uses_qwen_thinking(resolved_model, resolved_base):
+        reasoning_effort = None
+        extra_body = {"enable_thinking": True, "thinking_budget": 1024}
+    else:
+        reasoning_effort = "low"
+        extra_body = {}
     return LLM(
         usage_id=usage_id,
-        model=model or os.getenv("LLM_MODEL", "gpt-5.5"),
+        model=resolved_model,
         api_key=SecretStr(resolved_key),
-        base_url=base_url if base_url is not None else os.getenv("LLM_BASE_URL") or None,
-        reasoning_effort="low",
-        # 千问默认会写很长的隐藏思考。这里只留一小段，设计阶段的思考已经在阶段提示里。
-        litellm_extra_body={"enable_thinking": True, "thinking_budget": 1024},
+        base_url=resolved_base,
+        reasoning_effort=reasoning_effort,
+        litellm_extra_body=extra_body,
     )
 
 

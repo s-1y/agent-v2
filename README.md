@@ -1,72 +1,54 @@
-# Agent V2
+# Agent
 
-这是一套会自己分工的编程代理。你给它一句任务和一个工作区目录，它会在这个目录里读代码、改代码。同一次运行里的节点共用这一次的会话；下一次运行即使还用同一个工作区，也会另开一套会话，不会接着上次的节点往下聊。工作区里的项目文件每次都照常可读、可改。
+给一句任务，它会在一个目录里读代码、改代码。入口是 `Agents.v3`。
 
-## 准备 Python 环境
+grace 上可以直接读 `/home/syy/work/agent-v2`。先复制到自己的目录再配环境，不要改共享的那一份。那里没有你的密钥。
 
-用 Python 3.12。下面按 conda 来配，环境名用 `meta-agent`。
+## 环境
+
+用 Python 3.12。在仓库根目录：
 
 ```bash
-conda create -n meta-agent python=3.12 -y
-conda activate meta-agent
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
 pip install "openhands-sdk==1.45.0" "openhands-tools==1.45.0"
+pip install "browser-use==0.13.14"
+pip install "mcp==2.3.0" "anyio>=4.14" "click>=8.4.2"
 ```
 
-这两个包装的是对话、终端、文件编辑和浏览器。版本要成对，都用 1.45.0。
+Windows 上激活环境用 `.venv\Scripts\activate`。
 
-自己干活的阶段会打开本机 Chromium 看页面。Ubuntu 22.04 上安装：
+这几行会让 pip 打出「版本对不上」的提示，装完可以继续用，不要改回它建议的版本。`openhands-tools` 1.45 还在用旧的浏览器接口，所以 `browser-use` 钉在 `0.13.14`。这个旧包会把 `mcp`、`anyio`、`click` 拉低，OpenHands 又会导入失败，所以最后一行把它们装回去。冲突只在这个虚拟环境里。
+
+看网页的阶段需要 Playwright 的 Chrome，不要用 snap 里的 `chromium-browser`。没有浏览器时，读文件和改代码仍然可以做。
 
 ```bash
-sudo apt install -y chromium-browser
+python -m playwright install chromium
 ```
 
-装好后命令 `chromium-browser` 或 `chromium` 至少有一个能找到。没有浏览器时，这一阶段的浏览器工具起不来，读文件和改代码仍然可以做。
-
-## 配置模型
-
-在仓库根目录复制一份环境文件：
+## 密钥
 
 ```bash
 cp .env.example .env
 ```
 
-`.env` 不要提交。程序启动时会读它，已经写在系统环境里的同名变量不会被覆盖。需要这三项：
-
-| 变量 | 作用 |
-| --- | --- |
-| `LLM_API_KEY` | 模型密钥。没写时会再看 `DASHSCOPE_API_KEY`。两个都空会直接报错。 |
-| `LLM_MODEL` | 模型名。不写时默认是 `gpt-5.5`。 |
-| `LLM_BASE_URL` | 兼容接口地址。用官方默认地址时可以留空。 |
-
-走阿里云百炼时，`.env` 写成这样（密钥换成你自己的）：
+`.env` 不要提交。程序只在变量还没设过的时候读它。至少写 `LLM_API_KEY`。用千问、百炼时写成：
 
 ```bash
 LLM_API_KEY=sk-...
 LLM_MODEL=openai/qwen3.8-flash
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-LLM_DROP_PARAMS=true
 ```
 
-`LLM_DROP_PARAMS=true` 是给这种兼容接口用的。客户端会带上一些对方不认识的参数，设上之后这些参数会被丢掉，请求才能通过。
+走官方 OpenAI 时只填密钥，模型不写则默认 `gpt-5.5`，地址留空。
 
-## 跑一次
+## 跑
 
-在仓库根目录执行，这样 `python -m Agents.v2` 才能找到包：
+在仓库根目录、环境已激活时：
 
 ```bash
-conda activate meta-agent
-python -m Agents.v2.run --brief "把这个小游戏的界面改得能玩"
+python -m Agents.v3.run --brief "要做什么"
 ```
 
-不写 `--workspace` 时，工作区是仓库里的 `workspace/v2/<运行号>/`。要把改动落到已有项目上，把那个目录指过去：
-
-```bash
-python -m Agents.v2.run --brief "..." --workspace /path/to/project --viz
-```
-
-`--viz` 会在本机打开工作树页面，地址是 `http://127.0.0.1:8765/`。这台机器如果是远程的，用 Cursor 的 Ports 面板把 8765 转到自己的电脑再打开。
-
-跑完之后：
-
-- 日志和树在 `logging/v2/<运行号>.log`、`.tree.json`
-- 这次运行的节点会话在工作区的 `.meta_agent/runs/<运行号>/conversations/`
+`--brief` 是那句任务。`--repeat` 是做几版，默认 1。`--workspace` 指到已有项目；不写就用 `workspace/v3/<运行号>/`。`--viz` 打开 `http://127.0.0.1:8765/`。程序在远程机器上时，把 8765 转到自己的电脑再打开。
